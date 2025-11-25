@@ -1,7 +1,7 @@
 import streamlit as st
 from google import genai
 from google.genai import types
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 import json
 import io
 import os
@@ -90,10 +90,10 @@ def crop_image_normalized(image, box_2d, padding=0.05):
     
     return image.crop((left, top, right, bottom))
 
-def draw_highlight_on_image(image, box_2d, color="red", width=4):
+def draw_annotation_on_image(image, box_2d, number, color="red"):
     """
-    Draws a bounding box on the image given normalized [ymin, xmin, ymax, xmax] coordinates.
-    Returns a copy of the image with the highlight.
+    Draws a numbered badge on the image given normalized [ymin, xmin, ymax, xmax] coordinates.
+    Returns a copy of the image with the annotation.
     """
     img_copy = image.copy()
     draw = ImageDraw.Draw(img_copy)
@@ -101,12 +101,38 @@ def draw_highlight_on_image(image, box_2d, color="red", width=4):
     
     ymin, xmin, ymax, xmax = box_2d
     
+    # Calculate pixel coordinates
     left = (xmin / 1000) * img_w
     top = (ymin / 1000) * img_h
-    right = (xmax / 1000) * img_w
-    bottom = (ymax / 1000) * img_h
     
-    draw.rectangle([left, top, right, bottom], outline=color, width=width)
+    # Badge settings
+    badge_size = 30  # Diameter of the circle
+    text_size = 18   # Font size
+    
+    # Draw circle background
+    # Position the badge slightly offset from the top-left corner of the element
+    badge_left = max(0, left - badge_size/2)
+    badge_top = max(0, top - badge_size/2)
+    badge_right = badge_left + badge_size
+    badge_bottom = badge_top + badge_size
+    
+    draw.ellipse([badge_left, badge_top, badge_right, badge_bottom], fill=color, outline="white", width=2)
+    
+    # Draw number centered in circle
+    # Note: Using default font if specific font not available (usually fine for digits)
+    try:
+        # Try to load a larger font if system allows (optional)
+        font = ImageFont.load_default()
+    except:
+        font = None # Fallback
+
+    # Center text logic (simple approximation for default font)
+    text = str(number)
+    
+    # Draw text (white)
+    # Anchor 'mm' aligns the text vertically and horizontally centered
+    draw.text((badge_left + badge_size/2, badge_top + badge_size/2), text, fill="white", anchor="mm", font_size=text_size)
+    
     return img_copy
 
 # --- Pricing Constants (Gemini 3 Pro Preview) ---
@@ -128,8 +154,7 @@ def analyze_section_task(section, img_design, img_dev, client):
     
     logger.info(f"[{section_name}] Task started. Processing section...")
 
-    # Crop images (Pillow lazy loading usually thread safe for read, but copy is safer if needed)
-    # Here we create new cropped image objects, so it's safe.
+    # Crop images
     crop_design = crop_image_normalized(img_design, box, padding=0.1)
     crop_dev = crop_image_normalized(img_dev, box, padding=0.1)
     
@@ -182,19 +207,21 @@ def analyze_section_task(section, img_design, img_dev, client):
         diffs = json.loads(clean_json(response_diff.text))
         logger.info(f"[{section_name}] Analysis complete. Found {len(diffs)} discrepancies. Cost: ${s2_cost:.4f}")
         
-        # Draw highlights on Dev Crop for each issue
-        annotated_dev_crop = crop_dev.copy()
+        # Annotate DESIGN Crop instead of Dev Crop
+        annotated_design_crop = crop_design.copy()
+        
         if diffs:
-            for diff in diffs:
+            for idx, diff in enumerate(diffs):
                 if "box_2d" in diff:
-                    annotated_dev_crop = draw_highlight_on_image(annotated_dev_crop, diff["box_2d"], color="red", width=4)
+                    # Pass (idx + 1) to display numbers starting from 1
+                    annotated_design_crop = draw_annotation_on_image(annotated_design_crop, diff["box_2d"], number=(idx + 1))
 
         return {
             "success": True,
             "section_name": section_name,
             "diffs": diffs,
-            "crop_design": crop_design,
-            "crop_dev": annotated_dev_crop, # Return annotated image
+            "crop_design": annotated_design_crop, # Return annotated DESIGN
+            "crop_dev": crop_dev,                 # Return clean DEV
             "input_tokens": s2_input,
             "output_tokens": s2_output,
             "cost": s2_cost
@@ -252,10 +279,10 @@ if st.button("Start Pixel-Perfect Audit", type="primary"):
         
         Return a JSON list of objects:
         [
-            {
+            {{
                 "section_name": "Name of Section",
                 "box_2d": [ymin, xmin, ymax, xmax]
-            }
+            }}
         ]
         
         IMPORTANT: `box_2d` must be normalized coordinates (0-1000). Ensure the boxes strictly bound the component visuals.
@@ -331,13 +358,16 @@ if st.button("Start Pixel-Perfect Audit", type="primary"):
                         st.caption(f"Analysis Cost: ${result['cost']:.4f} (Tokens: {result['input_tokens'] + result['output_tokens']})")
                         
                         c1, c2 = st.columns(2)
-                        c1.image(result['crop_design'], caption=f"{section_name} (Design)")
-                        c2.image(result['crop_dev'], caption=f"{section_name} (Dev - Annotated)", width="stretch")
+                        # Display Annotated Design in Left Column
+                        c1.image(result['crop_design'], caption=f"{section_name} (Design - Annotated)", width="stretch")
+                        # Display Clean Dev in Right Column
+                        c2.image(result['crop_dev'], caption=f"{section_name} (Dev - Actual)", width="stretch")
                         
                         markdown_report += f"## Section: {section_name}\n\n"
-                        for diff in diffs:
-                            st.markdown(f"- **{diff['issue_title']}**: {diff['description']}")
-                            markdown_report += f"- **{diff['issue_title']}**: {diff['description']}\n"
+                        for idx, diff in enumerate(diffs):
+                            # Add numbering to text to match image badge
+                            st.markdown(f"**{idx+1}. {diff['issue_title']}**: {diff['description']}")
+                            markdown_report += f"**{idx+1}. {diff['issue_title']}**: {diff['description']}\n"
                         
                         st.divider()
             else:
