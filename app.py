@@ -6,16 +6,15 @@ import json
 import io
 import os
 import time
+import concurrent.futures
 
 # Page Config
 st.set_page_config(page_title="Design vs. Dev Comparator", layout="wide")
 
-st.title("🎨 Design vs. Dev Comparator (Iterative Mode)")
+st.title("🎨 Design vs. Dev Comparator (Pixel Perfect Mode)")
 st.markdown("""
 Upload your **Design Prototype** and the **Developer Implementation**. 
-This tool uses **Gemini 3 Pro Preview** to:
-1.  **Scan** the design to identify key sections (Sidebar, Header, Table, etc.).
-2.  **Iteratively Analyze** each section in detail for high-precision discrepancy detection.
+This tool uses **Gemini 3 Pro Preview** to perform a **strict UI audit**, ignoring content differences.
 """)
 
 # Sidebar for Configuration
@@ -43,12 +42,12 @@ col1, col2 = st.columns(2)
 with col1:
     design_file = st.file_uploader("Upload Design (Prototype)", type=["png", "jpg", "jpeg"])
     if design_file:
-        st.image(design_file, caption="Design Prototype", use_container_width=True)
+        st.image(design_file, caption="Design Prototype", width="stretch")
 
 with col2:
     dev_file = st.file_uploader("Upload Implementation (Dev)", type=["png", "jpg", "jpeg"])
     if dev_file:
-        st.image(dev_file, caption="Developer Implementation", use_container_width=True)
+        st.image(dev_file, caption="Developer Implementation", width="stretch")
 
 def clean_json(text):
     """Extracts JSON from markdown code blocks if present."""
@@ -82,7 +81,89 @@ def crop_image_normalized(image, box_2d, padding=0.05):
     
     return image.crop((left, top, right, bottom))
 
-if st.button("Start Iterative Analysis", type="primary"):
+# --- Pricing Constants (Gemini 3 Pro Preview) ---
+# < 200k Context Window
+PRICE_INPUT_1M = 2.00
+PRICE_OUTPUT_1M = 12.00
+
+def calculate_cost(input_toks, output_toks):
+    c_in = (input_toks / 1_000_000) * PRICE_INPUT_1M
+    c_out = (output_toks / 1_000_000) * PRICE_OUTPUT_1M
+    return c_in + c_out
+
+def analyze_section_task(section, img_design, img_dev, client):
+    """
+    Task to be run in parallel for analyzing a single section.
+    """
+    section_name = section['section_name']
+    box = section['box_2d']
+    
+    # Crop images (Pillow lazy loading usually thread safe for read, but copy is safer if needed)
+    # Here we create new cropped image objects, so it's safe.
+    crop_design = crop_image_normalized(img_design, box, padding=0.1)
+    crop_dev = crop_image_normalized(img_dev, box, padding=0.1)
+    
+    prompt_diff = f"""
+    You are a Lead UI/UX Designer conducting a strict Design QA audit.
+    Your goal is Pixel Perfection. The Developer (Image 2) must match the Design (Image 1) exactly in style.
+    
+    Compare these two crops of the '{section_name}'.
+    
+    IMPORTANT RULES:
+    1. **IGNORE CONTENT:** Do not report differences in text (e.g., "John" vs "Jane"), dates, or specific data values. Both are prototypes.
+    2. **FOCUS ON STYLE & STRUCTURE:** Report differences in:
+       - **Typography:** Font family, specific weights (bold vs semibold), size (px), line-height, letter-spacing, text color/opacity.
+       - **Layout:** Inner Padding, Outer Margins, Element Alignment (left/center/right), Vertical rhythm/spacing between items.
+       - **Components:** Border radius consistency, Shadow depth/spread, Border color/width/style.
+       - **Iconography:** Icon style (filled vs outlined), stroke width, size, consistency.
+    
+    Return a JSON list of the top 5 critical visual discrepancies:
+    [
+        {{
+            "issue_title": "Specific element name (e.g. 'Primary Button Shadow')",
+            "description": "Precise critique. E.g., 'Shadow is too harsh (approx 40% opacity) compared to design (soft, ~10% opacity). Border radius is 4px, design looks like 8px.'"
+        }}
+    ]
+    """
+    
+    try:
+        response_diff = client.models.generate_content(
+            model='gemini-3-pro-preview',
+            contents=[prompt_diff, crop_design, crop_dev],
+            config=types.GenerateContentConfig(temperature=0.2, response_mime_type="application/json")
+        )
+        
+        s2_input = 0
+        s2_output = 0
+        s2_cost = 0.0
+        
+        if response_diff.usage_metadata:
+            s2_input = response_diff.usage_metadata.prompt_token_count
+            s2_output = response_diff.usage_metadata.candidates_token_count
+            s2_cost = calculate_cost(s2_input, s2_output)
+            
+        diffs = json.loads(clean_json(response_diff.text))
+        
+        return {
+            "success": True,
+            "section_name": section_name,
+            "diffs": diffs,
+            "crop_design": crop_design,
+            "crop_dev": crop_dev,
+            "input_tokens": s2_input,
+            "output_tokens": s2_output,
+            "cost": s2_cost
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "section_name": section_name,
+            "error": str(e)
+        }
+
+
+if st.button("Start Pixel-Perfect Audit", type="primary"):
     if not design_file or not dev_file:
         st.error("Please upload both images.")
         st.stop()
@@ -107,12 +188,21 @@ if st.button("Start Iterative Analysis", type="primary"):
     # Load Images
     img_design = Image.open(design_file)
     img_dev = Image.open(dev_file)
+    
+    # Force load images into memory to prevent thread race conditions on file pointers
+    img_design.load()
+    img_dev.load()
 
     # --- Stage 1: Segmentation ---
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_cost = 0.0
+    
     with status_container:
         st.write("🔍 Phase 1: Scanning UI Structure...")
         prompt_structure = """
-        Analyze this UI Design. Identify the 4-6 major high-level sections (e.g., Sidebar, Header, Main Content Area, Filters Toolbar, Footer).
+        Analyze this UI Design image. 
+        Break it down into its logical functional components (e.g., "Sidebar Navigation", "Top Header Bar", "Filter Toolbar", "Main Data Table/Grid", "Footer/Pagination").
         
         Return a JSON list of objects:
         [
@@ -122,7 +212,7 @@ if st.button("Start Iterative Analysis", type="primary"):
             }
         ]
         
-        IMPORTANT: `box_2d` must be normalized coordinates (0-1000). Ensure the boxes cover the entire section.
+        IMPORTANT: `box_2d` must be normalized coordinates (0-1000). Ensure the boxes strictly bound the component visuals.
         """
         
         try:
@@ -131,80 +221,91 @@ if st.button("Start Iterative Analysis", type="primary"):
                 contents=[prompt_structure, img_design],
                 config=types.GenerateContentConfig(temperature=0.2, response_mime_type="application/json")
             )
+            
+            # Track Usage - Stage 1
+            s1_input = 0
+            s1_output = 0
+            s1_cost = 0.0
+            
+            if response_struct.usage_metadata:
+                s1_input = response_struct.usage_metadata.prompt_token_count
+                s1_output = response_struct.usage_metadata.candidates_token_count
+                s1_cost = calculate_cost(s1_input, s1_output)
+                
+                total_input_tokens += s1_input
+                total_output_tokens += s1_output
+                total_cost += s1_cost
+                
+            st.caption(f"Phase 1 Cost: ${s1_cost:.4f} (In: {s1_input} / Out: {s1_output})")
+            
             sections = json.loads(clean_json(response_struct.text))
             st.write(f"✅ Identified {len(sections)} sections: {', '.join([s['section_name'] for s in sections])}")
         except Exception as e:
             st.error(f"Failed to identify sections: {e}")
             st.stop()
 
-    # --- Stage 2: Iterative Analysis ---
-    all_discrepancies = []
+    # --- Stage 2: Parallel Iterative Analysis ---
     
+    with status_container:
+        st.write(f"🔬 Phase 2: Auditing {len(sections)} sections in parallel...")
+        
     progress_bar = status_container.progress(0)
     
-    for idx, section in enumerate(sections):
-        section_name = section['section_name']
-        box = section['box_2d']
-        
-        with status_container:
-            st.write(f"🔬 Phase 2: Analyzing **{section_name}** ({idx+1}/{len(sections)})...")
-            
-        # Crop the "Region of Interest" from both images
-        # We rely on the Dev implementation having roughly the same layout.
-        # Padding helps capture it if it's slightly shifted.
-        crop_design = crop_image_normalized(img_design, box, padding=0.1)
-        crop_dev = crop_image_normalized(img_dev, box, padding=0.1)
-        
-        prompt_diff = f"""
-        You are a QA Design Engineer. Compare these two cropped images of the '{section_name}'.
-        Image 1 is the Design Prototype (Expected). Image 2 is the Dev Implementation (Actual).
-        
-        Identify 3-5 specific visual discrepancies in this section. Look for:
-        - Alignment issues
-        - Wrong colors/fonts/icons
-        - Missing elements
-        - Spacing errors
-
-        Return a JSON list:
-        [
-            {{
-                "issue_title": "Concise Title",
-                "description": "Clear explanation of the difference."
-            }}
-        ]
-        """
-        
-        try:
-            response_diff = client.models.generate_content(
-                model='gemini-3-pro-preview',
-                contents=[prompt_diff, crop_design, crop_dev],
-                config=types.GenerateContentConfig(temperature=0.2, response_mime_type="application/json")
-            )
-            
-            diffs = json.loads(clean_json(response_diff.text))
-            
-            if diffs:
-                with report_container:
-                    st.subheader(f"📍 {section_name}")
-                    
-                    # Show the context crops
-                    c1, c2 = st.columns(2)
-                    c1.image(crop_design, caption=f"{section_name} (Design)")
-                    c2.image(crop_dev, caption=f"{section_name} (Dev)")
-                    
-                    markdown_report += f"## Section: {section_name}\n\n"
-                    
-                    for diff in diffs:
-                        st.markdown(f"- **{diff['issue_title']}**: {diff['description']}")
-                        markdown_report += f"- **{diff['issue_title']}**: {diff['description']}\n"
-                    
-                    st.divider()
-                    
-        except Exception as e:
-            st.warning(f"Could not analyze section {section_name}: {e}")
-            
-        progress_bar.progress((idx + 1) / len(sections))
-
-    status_container.update(label="Analysis Complete!", state="complete", expanded=False)
+    # Prepare tasks
+    completed_count = 0
     
-    st.download_button("Download Full Report", markdown_report, file_name="iterative_design_report.md")
+    # Use ThreadPoolExecutor to parallelize requests
+    # Note: genai.Client is generally thread-safe for stateless calls, but creating a new client per thread 
+    # or passing it is fine. Here we pass the shared client.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        # Submit all tasks
+        future_to_section = {
+            executor.submit(analyze_section_task, section, img_design, img_dev, client): section 
+            for section in sections
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_section):
+            result = future.result()
+            completed_count += 1
+            progress_bar.progress(completed_count / len(sections))
+            
+            if result["success"]:
+                # Update totals (Safe here because we are back in the main thread loop)
+                total_input_tokens += result["input_tokens"]
+                total_output_tokens += result["output_tokens"]
+                total_cost += result["cost"]
+                
+                section_name = result["section_name"]
+                diffs = result["diffs"]
+                
+                if diffs:
+                    with report_container:
+                        # Render result immediately
+                        st.subheader(f"📍 {section_name}")
+                        st.caption(f"Analysis Cost: ${result['cost']:.4f} (Tokens: {result['input_tokens'] + result['output_tokens']})")
+                        
+                        c1, c2 = st.columns(2)
+                        c1.image(result['crop_design'], caption=f"{section_name} (Design)")
+                        c2.image(result['crop_dev'], caption=f"{section_name} (Dev)")
+                        
+                        markdown_report += f"## Section: {section_name}\n\n"
+                        for diff in diffs:
+                            st.markdown(f"- **{diff['issue_title']}**: {diff['description']}")
+                            markdown_report += f"- **{diff['issue_title']}**: {diff['description']}\n"
+                        
+                        st.divider()
+            else:
+                st.warning(f"Failed to analyze {result['section_name']}: {result.get('error')}")
+
+    status_container.update(label="Audit Complete!", state="complete", expanded=False)
+    
+    # --- Final Sidebar Totals ---
+    st.sidebar.divider()
+    st.sidebar.subheader("💰 Usage & Cost Estimate")
+    st.sidebar.write(f"**Input Tokens:** {total_input_tokens:,}")
+    st.sidebar.write(f"**Output Tokens:** {total_output_tokens:,}")
+    st.sidebar.write(f"**Total Tokens:** {total_input_tokens + total_output_tokens:,}")
+    st.sidebar.markdown(f"### Estimated Cost: **${total_cost:.4f}**")
+    st.sidebar.caption(f"*Based on Gemini 3.0 Preview pricing (<200k tier): ${PRICE_INPUT_1M}/1M in, ${PRICE_OUTPUT_1M}/1M out.*")
+    
+    st.download_button("Download Audit Report", markdown_report, file_name="pixel_perfect_audit.md")
