@@ -8,6 +8,9 @@ import os
 import time
 import concurrent.futures
 import logging
+import zipfile
+import tempfile
+import shutil
 
 # Configure Logging
 logging.basicConfig(
@@ -256,6 +259,12 @@ if st.button("Start Pixel-Perfect Audit", type="primary"):
 
     status_container = st.status("Processing...", expanded=True)
     report_container = st.container()
+    
+    # Setup Temp Directory for Report
+    temp_dir = tempfile.mkdtemp(prefix="audit_pkg_")
+    images_dir = os.path.join(temp_dir, "images")
+    os.makedirs(images_dir, exist_ok=True)
+    
     markdown_report = "# Iterative Design Discrepancy Report\n\n"
     
     # Load Images
@@ -352,6 +361,14 @@ if st.button("Start Pixel-Perfect Audit", type="primary"):
                 diffs = result["diffs"]
                 
                 if diffs:
+                    # Save images to temp disk
+                    clean_name = "".join([c if c.isalnum() else "_" for c in section_name])
+                    design_img_name = f"{clean_name}_design.png"
+                    dev_img_name = f"{clean_name}_dev.png"
+                    
+                    result['crop_design'].save(os.path.join(images_dir, design_img_name))
+                    result['crop_dev'].save(os.path.join(images_dir, dev_img_name))
+
                     with report_container:
                         # Render result immediately
                         st.subheader(f"📍 {section_name}")
@@ -364,16 +381,38 @@ if st.button("Start Pixel-Perfect Audit", type="primary"):
                         c2.image(result['crop_dev'], caption=f"{section_name} (Dev - Actual)", width="stretch")
                         
                         markdown_report += f"## Section: {section_name}\n\n"
+                        # Add image table to markdown
+                        markdown_report += f"| Design (Expected) | Dev (Actual) |\n|---|---|\n"
+                        markdown_report += f"| ![{section_name} Design](images/{design_img_name}) | ![{section_name} Dev](images/{dev_img_name}) |\n\n"
+
                         for idx, diff in enumerate(diffs):
                             # Add numbering to text to match image badge
                             st.markdown(f"**{idx+1}. {diff['issue_title']}**: {diff['description']}")
                             markdown_report += f"**{idx+1}. {diff['issue_title']}**: {diff['description']}\n"
                         
+                        markdown_report += "\n---\n\n"
                         st.divider()
             else:
                 st.warning(f"Failed to analyze {result['section_name']}: {result.get('error')}")
 
     status_container.update(label="Audit Complete!", state="complete", expanded=False)
+    
+    # --- Finalizing Package ---
+    # Write report to temp dir
+    with open(os.path.join(temp_dir, "audit_report.md"), "w") as f:
+        f.write(markdown_report)
+        
+    # Create Zip
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(temp_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                arcname = os.path.relpath(file_path, temp_dir)
+                zf.write(file_path, arcname)
+    
+    # Clean up temp dir
+    shutil.rmtree(temp_dir)
     
     # --- Final Sidebar Totals ---
     st.sidebar.divider()
@@ -384,4 +423,9 @@ if st.button("Start Pixel-Perfect Audit", type="primary"):
     st.sidebar.markdown(f"### Estimated Cost: **${total_cost:.4f}**")
     st.sidebar.caption(f"*Based on Gemini 3.0 Preview pricing (<200k tier): ${PRICE_INPUT_1M}/1M in, ${PRICE_OUTPUT_1M}/1M out.*")
     
-    st.download_button("Download Audit Report", markdown_report, file_name="pixel_perfect_audit.md")
+    st.download_button(
+        "📦 Download Full Audit Package (.zip)", 
+        data=zip_buffer.getvalue(), 
+        file_name="pixel_perfect_audit_package.zip", 
+        mime="application/zip"
+    )
