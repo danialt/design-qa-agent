@@ -1,12 +1,21 @@
 import streamlit as st
 from google import genai
 from google.genai import types
-from PIL import Image
+from PIL import Image, ImageDraw
 import json
 import io
 import os
 import time
 import concurrent.futures
+import logging
+
+# Configure Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - [Thread: %(threadName)s] - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
 # Page Config
 st.set_page_config(page_title="Design vs. Dev Comparator", layout="wide")
@@ -81,6 +90,25 @@ def crop_image_normalized(image, box_2d, padding=0.05):
     
     return image.crop((left, top, right, bottom))
 
+def draw_highlight_on_image(image, box_2d, color="red", width=4):
+    """
+    Draws a bounding box on the image given normalized [ymin, xmin, ymax, xmax] coordinates.
+    Returns a copy of the image with the highlight.
+    """
+    img_copy = image.copy()
+    draw = ImageDraw.Draw(img_copy)
+    img_w, img_h = img_copy.size
+    
+    ymin, xmin, ymax, xmax = box_2d
+    
+    left = (xmin / 1000) * img_w
+    top = (ymin / 1000) * img_h
+    right = (xmax / 1000) * img_w
+    bottom = (ymax / 1000) * img_h
+    
+    draw.rectangle([left, top, right, bottom], outline=color, width=width)
+    return img_copy
+
 # --- Pricing Constants (Gemini 3 Pro Preview) ---
 # < 200k Context Window
 PRICE_INPUT_1M = 2.00
@@ -98,10 +126,14 @@ def analyze_section_task(section, img_design, img_dev, client):
     section_name = section['section_name']
     box = section['box_2d']
     
+    logger.info(f"[{section_name}] Task started. Processing section...")
+
     # Crop images (Pillow lazy loading usually thread safe for read, but copy is safer if needed)
     # Here we create new cropped image objects, so it's safe.
     crop_design = crop_image_normalized(img_design, box, padding=0.1)
     crop_dev = crop_image_normalized(img_dev, box, padding=0.1)
+    
+    logger.info(f"[{section_name}] Images cropped. Preparing Gemini prompt...")
     
     prompt_diff = f"""
     You are a Lead UI/UX Designer conducting a strict Design QA audit.
@@ -121,17 +153,22 @@ def analyze_section_task(section, img_design, img_dev, client):
     [
         {{
             "issue_title": "Specific element name (e.g. 'Primary Button Shadow')",
-            "description": "Precise critique. E.g., 'Shadow is too harsh (approx 40% opacity) compared to design (soft, ~10% opacity). Border radius is 4px, design looks like 8px.'"
+            "description": "Precise critique. E.g., 'Shadow is too harsh (approx 40% opacity) compared to design (soft, ~10% opacity). Border radius is 4px, design looks like 8px.'",
+            "box_2d": [ymin, xmin, ymax, xmax]
         }}
     ]
+    
+    IMPORTANT: `box_2d` should be the normalized coordinates (0-1000) RELATIVE TO THIS CROP IMAGE identifying the specific element causing the issue.
     """
     
     try:
+        logger.info(f"[{section_name}] Sending request to Gemini 3 Pro Preview...")
         response_diff = client.models.generate_content(
             model='gemini-3-pro-preview',
             contents=[prompt_diff, crop_design, crop_dev],
             config=types.GenerateContentConfig(temperature=0.2, response_mime_type="application/json")
         )
+        logger.info(f"[{section_name}] Response received from Gemini.")
         
         s2_input = 0
         s2_output = 0
@@ -143,19 +180,28 @@ def analyze_section_task(section, img_design, img_dev, client):
             s2_cost = calculate_cost(s2_input, s2_output)
             
         diffs = json.loads(clean_json(response_diff.text))
+        logger.info(f"[{section_name}] Analysis complete. Found {len(diffs)} discrepancies. Cost: ${s2_cost:.4f}")
         
+        # Draw highlights on Dev Crop for each issue
+        annotated_dev_crop = crop_dev.copy()
+        if diffs:
+            for diff in diffs:
+                if "box_2d" in diff:
+                    annotated_dev_crop = draw_highlight_on_image(annotated_dev_crop, diff["box_2d"], color="red", width=4)
+
         return {
             "success": True,
             "section_name": section_name,
             "diffs": diffs,
             "crop_design": crop_design,
-            "crop_dev": crop_dev,
+            "crop_dev": annotated_dev_crop, # Return annotated image
             "input_tokens": s2_input,
             "output_tokens": s2_output,
             "cost": s2_cost
         }
         
     except Exception as e:
+        logger.error(f"[{section_name}] Error occurred: {str(e)}")
         return {
             "success": False,
             "section_name": section_name,
@@ -286,7 +332,7 @@ if st.button("Start Pixel-Perfect Audit", type="primary"):
                         
                         c1, c2 = st.columns(2)
                         c1.image(result['crop_design'], caption=f"{section_name} (Design)")
-                        c2.image(result['crop_dev'], caption=f"{section_name} (Dev)")
+                        c2.image(result['crop_dev'], caption=f"{section_name} (Dev - Annotated)", width="stretch")
                         
                         markdown_report += f"## Section: {section_name}\n\n"
                         for diff in diffs:
