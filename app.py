@@ -11,6 +11,7 @@ import logging
 import zipfile
 import tempfile
 import shutil
+import base64
 
 # Configure Logging
 logging.basicConfig(
@@ -93,50 +94,61 @@ def crop_image_normalized(image, box_2d, padding=0.05):
     
     return image.crop((left, top, right, bottom))
 
-def draw_annotation_on_image(image, box_2d, number, color="red"):
-    """
-    Draws a numbered badge on the image given normalized [ymin, xmin, ymax, xmax] coordinates.
-    Returns a copy of the image with the annotation.
-    """
-    img_copy = image.copy()
-    draw = ImageDraw.Draw(img_copy)
-    img_w, img_h = img_copy.size
-    
-    ymin, xmin, ymax, xmax = box_2d
-    
-    # Calculate pixel coordinates
-    left = (xmin / 1000) * img_w
-    top = (ymin / 1000) * img_h
-    
-    # Badge settings
-    badge_size = 30  # Diameter of the circle
-    text_size = 18   # Font size
-    
-    # Draw circle background
-    # Position the badge slightly offset from the top-left corner of the element
-    badge_left = max(0, left - badge_size/2)
-    badge_top = max(0, top - badge_size/2)
-    badge_right = badge_left + badge_size
-    badge_bottom = badge_top + badge_size
-    
-    draw.ellipse([badge_left, badge_top, badge_right, badge_bottom], fill=color, outline="white", width=2)
-    
-    # Draw number centered in circle
-    # Note: Using default font if specific font not available (usually fine for digits)
-    try:
-        # Try to load a larger font if system allows (optional)
-        font = ImageFont.load_default()
-    except:
-        font = None # Fallback
+def image_to_base64(image):
+    """Converts PIL Image to base64 string."""
+    buffered = io.BytesIO()
+    image.save(buffered, format="PNG")
+    return base64.b64encode(buffered.getvalue()).decode()
 
-    # Center text logic (simple approximation for default font)
-    text = str(number)
+def generate_annotated_html(image, diffs, caption=""):
+    """
+    Generates HTML/CSS to display image with overlaid numbered badges.
+    """
+    img_b64 = image_to_base64(image)
     
-    # Draw text (white)
-    # Anchor 'mm' aligns the text vertically and horizontally centered
-    draw.text((badge_left + badge_size/2, badge_top + badge_size/2), text, fill="white", anchor="mm", font_size=text_size)
+    # Base container style
+    html = f"""
+    <div style="position: relative; display: inline-block; width: 100%; margin-bottom: 10px;">
+        <img src="data:image/png;base64,{img_b64}" style="width: 100%; display: block; border-radius: 4px;">
+        <div style="font-size: 14px; color: rgba(49, 51, 63, 0.6); margin-top: 5px; text-align: center;">{caption}</div>
+    """
     
-    return img_copy
+    # Add badges
+    if diffs:
+        for idx, diff in enumerate(diffs):
+            if "box_2d" in diff:
+                ymin, xmin, ymax, xmax = diff["box_2d"]
+                
+                # Convert normalized coordinates (0-1000) to percentage (0-100%)
+                # We position the badge at the top-left of the box
+                top_pct = (ymin / 1000) * 100
+                left_pct = (xmin / 1000) * 100
+                
+                # Badge Style
+                badge_style = f"""
+                    position: absolute;
+                    top: {top_pct}%;
+                    left: {left_pct}%;
+                    transform: translate(-50%, -50%);
+                    background-color: #FF4B4B;
+                    color: white;
+                    width: 24px;
+                    height: 24px;
+                    border-radius: 50%;
+                    text-align: center;
+                    line-height: 24px;
+                    font-weight: bold;
+                    font-size: 14px;
+                    border: 2px solid white;
+                    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+                    pointer-events: none;
+                    z-index: 10;
+                """
+                
+                html += f'<div style="{badge_style}">{idx + 1}</div>'
+    
+    html += "</div>"
+    return html
 
 # --- Pricing Constants (Gemini 3 Pro Preview) ---
 # < 200k Context Window
@@ -157,7 +169,8 @@ def analyze_section_task(section, img_design, img_dev, client):
     
     logger.info(f"[{section_name}] Task started. Processing section...")
 
-    # Crop images
+    # Crop images (Pillow lazy loading usually thread safe for read, but copy is safer if needed)
+    # Here we create new cropped image objects, so it's safe.
     crop_design = crop_image_normalized(img_design, box, padding=0.1)
     crop_dev = crop_image_normalized(img_dev, box, padding=0.1)
     
@@ -210,21 +223,13 @@ def analyze_section_task(section, img_design, img_dev, client):
         diffs = json.loads(clean_json(response_diff.text))
         logger.info(f"[{section_name}] Analysis complete. Found {len(diffs)} discrepancies. Cost: ${s2_cost:.4f}")
         
-        # Annotate DESIGN Crop instead of Dev Crop
-        annotated_design_crop = crop_design.copy()
-        
-        if diffs:
-            for idx, diff in enumerate(diffs):
-                if "box_2d" in diff:
-                    # Pass (idx + 1) to display numbers starting from 1
-                    annotated_design_crop = draw_annotation_on_image(annotated_design_crop, diff["box_2d"], number=(idx + 1))
-
+        # Return clean images + diffs. No drawing here.
         return {
             "success": True,
             "section_name": section_name,
             "diffs": diffs,
-            "crop_design": annotated_design_crop, # Return annotated DESIGN
-            "crop_dev": crop_dev,                 # Return clean DEV
+            "crop_design": crop_design, # Return clean DESIGN
+            "crop_dev": crop_dev,       # Return clean DEV
             "input_tokens": s2_input,
             "output_tokens": s2_output,
             "cost": s2_cost
@@ -288,10 +293,10 @@ if st.button("Start Pixel-Perfect Audit", type="primary"):
         
         Return a JSON list of objects:
         [
-            {{
+            {
                 "section_name": "Name of Section",
                 "box_2d": [ymin, xmin, ymax, xmax]
-            }}
+            }
         ]
         
         IMPORTANT: `box_2d` must be normalized coordinates (0-1000). Ensure the boxes strictly bound the component visuals.
@@ -337,8 +342,6 @@ if st.button("Start Pixel-Perfect Audit", type="primary"):
     completed_count = 0
     
     # Use ThreadPoolExecutor to parallelize requests
-    # Note: genai.Client is generally thread-safe for stateless calls, but creating a new client per thread 
-    # or passing it is fine. Here we pass the shared client.
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         # Submit all tasks
         future_to_section = {
@@ -352,7 +355,7 @@ if st.button("Start Pixel-Perfect Audit", type="primary"):
             progress_bar.progress(completed_count / len(sections))
             
             if result["success"]:
-                # Update totals (Safe here because we are back in the main thread loop)
+                # Update totals
                 total_input_tokens += result["input_tokens"]
                 total_output_tokens += result["output_tokens"]
                 total_cost += result["cost"]
@@ -375,16 +378,22 @@ if st.button("Start Pixel-Perfect Audit", type="primary"):
                         st.caption(f"Analysis Cost: ${result['cost']:.4f} (Tokens: {result['input_tokens'] + result['output_tokens']})")
                         
                         c1, c2 = st.columns(2)
-                        # Display Annotated Design in Left Column
-                        c1.image(result['crop_design'], caption=f"{section_name} (Design - Annotated)", width="stretch")
-                        # Display Clean Dev in Right Column
-                        c2.image(result['crop_dev'], caption=f"{section_name} (Dev - Actual)", width="stretch")
+                        
+                        # HTML Overlay for Design (Using clean image + diff coordinates)
+                        with c1:
+                            html = generate_annotated_html(result['crop_design'], diffs, caption=f"{section_name} (Design - Annotated)")
+                            st.markdown(html, unsafe_allow_html=True)
+                            
+                        # Standard HTML wrapper for Dev (clean, consistent style)
+                        with c2:
+                            html_dev = generate_annotated_html(result['crop_dev'], [], caption=f"{section_name} (Dev - Actual)")
+                            st.markdown(html_dev, unsafe_allow_html=True)
                         
                         markdown_report += f"## Section: {section_name}\n\n"
                         # Add image table to markdown
                         markdown_report += f"| Design (Expected) | Dev (Actual) |\n|---|---|\n"
                         markdown_report += f"| ![{section_name} Design](images/{design_img_name}) | ![{section_name} Dev](images/{dev_img_name}) |\n\n"
-
+                        
                         for idx, diff in enumerate(diffs):
                             # Add numbering to text to match image badge
                             st.markdown(f"**{idx+1}. {diff['issue_title']}**: {diff['description']}")
