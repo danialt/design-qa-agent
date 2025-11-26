@@ -156,15 +156,35 @@ def generate_annotated_html(image, diffs, caption=""):
     html += "</div>"
     return html
 
-# --- Pricing Constants (Gemini 3 Pro Preview) ---
-# < 200k Context Window
-PRICE_INPUT_1M = 2.00
-PRICE_OUTPUT_1M = 12.00
+# --- Pricing Constants (Gemini 2.5 Pro) ---
+# Pricing tiers based on prompt size
+# <= 200k tokens: $2.00 input, $12.00 output
+# > 200k tokens: $4.00 input, $18.00 output
+# Context caching: $0.20 (<=200k) / $0.40 (>200k) per 1M tokens
+# Cache storage: $4.50 per 1M tokens per hour
+PRICE_INPUT_1M_LOW = 2.00      # prompts <= 200k tokens
+PRICE_INPUT_1M_HIGH = 4.00     # prompts > 200k tokens
+PRICE_OUTPUT_1M_LOW = 12.00    # prompts <= 200k tokens
+PRICE_OUTPUT_1M_HIGH = 18.00   # prompts > 200k tokens
+PRICE_CACHE_INPUT_LOW = 0.20   # prompts <= 200k tokens
+PRICE_CACHE_INPUT_HIGH = 0.40  # prompts > 200k tokens
+PRICE_CACHE_STORAGE = 4.50     # per 1M tokens per hour
 
-def calculate_cost(input_toks, output_toks):
-    c_in = (input_toks / 1_000_000) * PRICE_INPUT_1M
-    c_out = (output_toks / 1_000_000) * PRICE_OUTPUT_1M
-    return c_in + c_out
+def calculate_cost(input_toks, output_toks, cached_toks=0, prompt_size=0):
+    """Calculate cost based on token usage and prompt size tier."""
+    if prompt_size > 200_000:
+        price_in = PRICE_INPUT_1M_HIGH
+        price_out = PRICE_OUTPUT_1M_HIGH
+        price_cache = PRICE_CACHE_INPUT_HIGH
+    else:
+        price_in = PRICE_INPUT_1M_LOW
+        price_out = PRICE_OUTPUT_1M_LOW
+        price_cache = PRICE_CACHE_INPUT_LOW
+
+    c_in = (input_toks / 1_000_000) * price_in
+    c_out = (output_toks / 1_000_000) * price_out
+    c_cache = (cached_toks / 1_000_000) * price_cache
+    return c_in + c_out + c_cache
 
 def analyze_section_task(section, img_design, img_dev, client):
     """
@@ -444,7 +464,7 @@ if st.button("Start Pixel-Perfect Audit", type="primary"):
     st.sidebar.write(f"**Output Tokens:** {total_output_tokens:,}")
     st.sidebar.write(f"**Total Tokens:** {total_input_tokens + total_output_tokens:,}")
     st.sidebar.markdown(f"### Estimated Cost: **${total_cost:.4f}**")
-    st.sidebar.caption(f"*Based on Gemini 3.0 Preview pricing (<200k tier): ${PRICE_INPUT_1M}/1M in, ${PRICE_OUTPUT_1M}/1M out.*")
+    st.sidebar.caption(f"*Based on Gemini 2.5 Pro pricing (<=200k tier): ${PRICE_INPUT_1M_LOW}/1M in, ${PRICE_OUTPUT_1M_LOW}/1M out.*")
     
     st.download_button(
         "📦 Download Full Audit Package (.zip)", 
