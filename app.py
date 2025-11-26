@@ -36,12 +36,9 @@ This tool uses **Gemini 3 Pro Preview** to perform a **strict UI audit**, ignori
 
 # Sidebar for Configuration
 with st.sidebar:
-    with st.expander("Settings"):
-        try:
-            default_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
-        except FileNotFoundError:
-            default_key = os.environ.get("GEMINI_API_KEY", "")
-        api_key = st.text_input("Gemini API Key", value=default_key, type="password")
+    st.subheader("🔑 API Key")
+    api_key = st.text_input("Gemini API Key", type="password", placeholder="Enter your Gemini API key")
+    st.caption("Get your API key from [Google AI Studio](https://aistudio.google.com/apikey)")
 
 
 # File Uploads
