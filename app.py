@@ -1,4 +1,5 @@
 import streamlit as st
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont
@@ -12,6 +13,9 @@ import zipfile
 import tempfile
 import shutil
 import base64
+
+# Load environment variables from .env file if present
+load_dotenv()
 
 # Configure Logging
 logging.basicConfig(
@@ -32,17 +36,7 @@ This tool uses **Gemini 3 Pro Preview** to perform a **strict UI audit**, ignori
 
 # Sidebar for Configuration
 with st.sidebar:
-    st.header("Configuration")
-    
-    # Check for Vertex AI Environment Variables
-    use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() == "true"
-    project_id = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
-    
-    if use_vertex and project_id:
-        st.success(f"✅ Vertex AI Active\nProject: {project_id}\nLocation: {location}")
-    else:
-        st.warning("⚠️ Vertex AI not detected. Using API Key fallback.")
+    with st.expander("Settings"):
         try:
             default_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
         except FileNotFoundError:
@@ -251,12 +245,21 @@ if st.button("Start Pixel-Perfect Audit", type="primary"):
 
     # Initialize Client
     try:
-        if use_vertex and project_id:
-            client = genai.Client(vertexai=True, project=project_id, location=location)
-        elif api_key:
-            client = genai.Client(api_key=api_key)
+        if api_key:
+            # Clean the key
+            clean_key = api_key.strip()
+            
+            # Log usage (masked)
+            if len(clean_key) > 4:
+                logger.info(f"Initializing Gemini Client with API Key ending in ...{clean_key[-4:]}")
+            else:
+                logger.warning("API Key is very short.")
+
+            # Initialize client directly with API key, matching AI Studio pattern.
+            # The SDK should handle the correct endpoint for the model.
+            client = genai.Client(api_key=clean_key)
         else:
-            st.error("No authentication method found.")
+            st.error("No authentication method found. Please provide a Gemini API Key.")
             st.stop()
     except Exception as e:
         st.error(f"Authentication Error: {e}")
