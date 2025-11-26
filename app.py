@@ -37,7 +37,22 @@ This tool uses **Gemini 3 Pro Preview** to perform a **strict UI audit**, ignori
 # Sidebar for Configuration
 with st.sidebar:
     st.subheader("🔑 API Key")
-    api_key = st.text_input("Gemini API Key", type="password", placeholder="Enter your Gemini API key")
+
+    # Initialize session state for API key
+    if "gemini_api_key" not in st.session_state:
+        st.session_state.gemini_api_key = ""
+
+    api_key = st.text_input(
+        "Gemini API Key",
+        type="password",
+        placeholder="Enter your Gemini API key",
+        value=st.session_state.gemini_api_key
+    )
+
+    # Store in session state when entered
+    if api_key:
+        st.session_state.gemini_api_key = api_key
+
     st.caption("Get your API key from [Google AI Studio](https://aistudio.google.com/apikey)")
 
 
@@ -252,8 +267,7 @@ if st.button("Start Pixel-Perfect Audit", type="primary"):
             else:
                 logger.warning("API Key is very short.")
 
-            # Initialize client directly with API key, matching AI Studio pattern.
-            # The SDK should handle the correct endpoint for the model.
+            # Initialize client with API key for Google AI Studio
             client = genai.Client(api_key=clean_key)
         else:
             st.error("No authentication method found. Please provide a Gemini API Key.")
