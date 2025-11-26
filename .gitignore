@@ -1,0 +1,15 @@
+# venv
+venv/
+
+# __pycache__
+__pycache__/
+
+# .streamlit
+.streamlit/
+
+# .env
+.env
+
+# .gitignore
+
+# images
